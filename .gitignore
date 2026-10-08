@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+*.py[cod]
+reports.sqlite3
+*.wav
+*.m4a
