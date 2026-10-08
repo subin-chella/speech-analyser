@@ -1,6 +1,6 @@
 # Voice Practice
 
-A local Streamlit app for transcribing meeting audio, reviewing communication patterns with an AI model, and comparing saved reports over time.
+A local Streamlit app for transcribing meeting audio or uploading an existing transcript, reviewing communication patterns with an AI model, and comparing saved reports over time.
 
 ## Run
 
@@ -10,7 +10,7 @@ brew install ffmpeg
 .venv/bin/streamlit run app.py
 ```
 
-FFmpeg is used to convert uploaded audio to mono WAV before transcription. The first transcription may download the CrisperWhisper model. Transcription defaults to CPU for stability; the sidebar offers the Apple GPU backend as an experimental option, because some MPS audio workloads can trigger a native macOS crash. Audio is transcribed locally; only the transcript and calculated speech metrics are sent to the selected AI provider. Reports are stored in `reports.sqlite3` in this folder.
+Choose **Meeting audio** to transcribe an audio upload locally, or **Transcript** to upload a UTF-8 transcript such as `.txt`, `.md`, `.srt`, or `.vtt` and send its text through the coaching analysis. To calculate metrics for one participant, the transcript must include speaker labels (for example, `Alex:` or WebVTT `<v Alex>` tags) that match the focus name. If the speaker cannot be isolated, focused metrics are shown as unavailable rather than using whole-conversation values. Pause timing is available from audio word timestamps or timed transcript cues. The first audio transcription may download the CrisperWhisper model. Transcription defaults to CPU for stability; the sidebar offers the Apple GPU backend as an experimental option, because some MPS audio workloads can trigger a native macOS crash. The transcript and calculated speech metrics are sent to the selected AI provider. Reports are stored in `reports.sqlite3` in this folder.
 
 ## AI provider
 

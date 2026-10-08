@@ -52,12 +52,31 @@ def metric_value(metrics: dict, key: str) -> float:
     return float(metrics.get(key, 0))
 
 
+def clear_transcript_state() -> None:
+    for key in (
+        "transcript_editor",
+        "word_timestamps",
+        "audio_duration",
+        "audio_name",
+        "last_report_id",
+    ):
+        st.session_state.pop(key, None)
+
+
 def comparison_value(report: dict, group_name: str, key: str) -> float | None:
     values = (
         report.get("analysis", {}).get("scores", {})
         if group_name == "scores"
         else report.get(group_name, {})
     )
+    if group_name == "metrics" and values.get("metrics_available") is False:
+        return None
+    if (
+        group_name == "metrics"
+        and key == "long_pauses_per_minute"
+        and values.get("timing_available") is False
+    ):
+        return None
     value = values.get(key)
     return float(value) if isinstance(value, (int, float)) else None
 
@@ -127,6 +146,7 @@ def render_progress() -> None:
             {
                 filler
                 for report in chart_rows
+                if report["metrics"].get("metrics_available") is not False
                 for filler in report["metrics"].get("fillers_by_type", {})
             }
         )
@@ -140,6 +160,8 @@ def render_progress() -> None:
                     / max(report["metrics"].get("word_count", 0), 1),
                     1,
                 )
+                if report["metrics"].get("metrics_available") is not False
+                else None
                 for report in chart_rows
             ]
         else:
@@ -149,7 +171,16 @@ def render_progress() -> None:
     else:
         metric_key, group = metric_keys[chart_metric]
         chart_label = chart_metric
-        chart_values = [metric_value(item[group], metric_key) for item in chart_rows]
+        chart_values = [
+            None
+            if item["metrics"].get("metrics_available") is False
+            or (
+                metric_key == "long_pauses_per_minute"
+                and item["metrics"].get("timing_available") is False
+            )
+            else metric_value(item[group], metric_key)
+            for item in chart_rows
+        ]
     chart_data = {
         "Date": [item["session_date"] for item in chart_rows],
         chart_label: chart_values,
@@ -202,22 +233,30 @@ def render_progress() -> None:
         if filler_names:
             filler_comparison = []
             for filler in filler_names:
-                earlier_rate = (
-                    earlier["metrics"].get("fillers_by_type", {}).get(filler, 0)
-                    * 1000
-                    / max(earlier["metrics"].get("word_count", 0), 1)
-                )
-                later_rate = (
-                    later["metrics"].get("fillers_by_type", {}).get(filler, 0)
-                    * 1000
-                    / max(later["metrics"].get("word_count", 0), 1)
-                )
+                earlier_rate = None
+                if earlier["metrics"].get("metrics_available") is not False:
+                    earlier_rate = (
+                        earlier["metrics"].get("fillers_by_type", {}).get(filler, 0)
+                        * 1000
+                        / max(earlier["metrics"].get("word_count", 0), 1)
+                    )
+                later_rate = None
+                if later["metrics"].get("metrics_available") is not False:
+                    later_rate = (
+                        later["metrics"].get("fillers_by_type", {}).get(filler, 0)
+                        * 1000
+                        / max(later["metrics"].get("word_count", 0), 1)
+                    )
                 filler_comparison.append(
                     {
                         "Filler": filler,
-                        "Earlier / 1,000": round(earlier_rate, 1),
-                        "Later / 1,000": round(later_rate, 1),
-                        "Change / 1,000": round(later_rate - earlier_rate, 1),
+                        "Earlier / 1,000": round(earlier_rate, 1) if earlier_rate is not None else None,
+                        "Later / 1,000": round(later_rate, 1) if later_rate is not None else None,
+                        "Change / 1,000": (
+                            round(later_rate - earlier_rate, 1)
+                            if earlier_rate is not None and later_rate is not None
+                            else None
+                        ),
                     }
                 )
             st.markdown("#### Filler-by-filler comparison")
@@ -285,17 +324,46 @@ with st.sidebar:
 new_tab, progress_tab = st.tabs(("New report", "Progress"))
 
 with new_tab:
-    uploaded_audio = st.file_uploader(
-        "Meeting audio",
-        type=("wav", "mp3", "m4a", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"),
+    input_mode = st.radio(
+        "Input type",
+        ("Meeting audio", "Transcript"),
+        horizontal=True,
+        key="input_mode",
+        on_change=clear_transcript_state,
     )
+    uploaded_audio = None
+    if input_mode == "Meeting audio":
+        uploaded_audio = st.file_uploader(
+            "Meeting audio",
+            type=("wav", "mp3", "m4a", "mp4", "mpeg", "mpga", "webm", "ogg", "flac"),
+        )
+    else:
+        uploaded_transcript = st.file_uploader(
+            "Transcript file",
+            type=("txt", "md", "srt", "vtt", "tsv", "csv", "json"),
+        )
+        if st.button("Load transcript", disabled=uploaded_transcript is None):
+            try:
+                transcript_text = uploaded_transcript.getvalue().decode("utf-8-sig")
+                if not transcript_text.strip():
+                    raise ValueError("The uploaded transcript is empty.")
+                st.session_state["transcript_editor"] = transcript_text.strip()
+                st.session_state["word_timestamps"] = []
+                st.session_state["audio_duration"] = 0
+                st.session_state["audio_name"] = uploaded_transcript.name
+                st.success("Transcript ready for analysis.")
+            except UnicodeDecodeError:
+                st.error("Could not read this file as UTF-8 text. Upload the transcript encoded as UTF-8.")
+            except ValueError as error:
+                st.error(str(error))
+
     session_date = st.date_input("Meeting date", value=date.today())
     target_label = st.text_input(
         "Speaker to focus on (optional)",
-        help="Speakers are not identified automatically. For individual feedback, add prefixes such as Alex: to the transcript below, then enter that exact name here. Leave blank to assess the whole conversation.",
+        help="For speaker-specific metrics, the transcript must include speaker labels such as Alex: or WebVTT <v Alex> tags. Name order and unambiguous shortened names are matched. Audio transcription does not identify speakers automatically. Leave blank for whole-conversation metrics.",
     )
 
-    if st.button(
+    if input_mode == "Meeting audio" and st.button(
         "Transcribe audio",
         type="primary",
         disabled=uploaded_audio is None,
@@ -395,6 +463,7 @@ with new_tab:
                     st.session_state.get("word_timestamps", []),
                     st.session_state.get("audio_duration", 0),
                     pause_threshold,
+                    target_label.strip(),
                 )
                 with st.spinner("Preparing your coaching report..."):
                     analysis = analyze_transcript(
@@ -425,23 +494,34 @@ with new_tab:
             st.session_state.get("word_timestamps", []),
             st.session_state.get("audio_duration", 0),
             pause_threshold,
+            target_label.strip(),
         )
+        timing_available = metrics["timing_available"]
+        metrics_available = metrics["metrics_available"]
         metric_columns = st.columns(4)
-        metric_columns[0].metric("Words", metrics["word_count"])
-        metric_columns[1].metric("Fillers / 1,000 words", f"{metrics['filler_per_1000']:.1f}")
-        metric_columns[2].metric("Repeated words", metrics["repeated_words"])
-        metric_columns[3].metric("Long pauses", metrics["long_pause_count"])
+        metric_columns[0].metric("Words", metrics["word_count"] if metrics_available else "N/A")
+        metric_columns[1].metric(
+            "Fillers / 1,000 words",
+            f"{metrics['filler_per_1000']:.1f}" if metrics_available else "N/A",
+        )
+        metric_columns[2].metric("Repeated words", metrics["repeated_words"] if metrics_available else "N/A")
+        metric_columns[3].metric(
+            "Long pauses",
+            metrics["long_pause_count"] if metrics_available and timing_available else "N/A",
+        )
         filler_rows = sorted(
             (
                 {"Filler": filler, "Count": count, "Per 1,000 words": round(count * 1000 / max(metrics["word_count"], 1), 1)}
                 for filler, count in metrics["fillers_by_type"].items()
-                if count
+                if count and metrics_available
             ),
             key=lambda row: row["Count"],
             reverse=True,
         )
         st.markdown("#### Filler breakdown")
-        if filler_rows:
+        if not metrics_available:
+            st.caption(metrics["metrics_unavailable_reason"])
+        elif filler_rows:
             st.dataframe(filler_rows, hide_index=True, use_container_width=True)
             top_filler = filler_rows[0]
             st.caption(
@@ -450,11 +530,21 @@ with new_tab:
             )
         else:
             st.caption("No tracked filler words detected. Counts are transcript-based; correct any transcription errors above.")
-        st.caption(
-            f"Longest pause: {metrics['longest_pause_seconds']:.1f} s · "
-            f"Long pauses per minute: {metrics['long_pauses_per_minute']:.1f} · "
-            "Metrics are for the full recording."
-        )
+        if not metrics_available:
+            st.caption("Pause metrics are unavailable because this participant could not be isolated.")
+        elif timing_available:
+            metric_scope = (
+                f"Metrics are for {metrics['speaker_label']}; pause rate uses the meeting timeline."
+                if target_label.strip()
+                else "Metrics are for the full recording."
+            )
+            st.caption(
+                f"Longest pause: {metrics['longest_pause_seconds']:.1f} s · "
+                f"Long pauses per minute: {metrics['long_pauses_per_minute']:.1f} · "
+                f"{metric_scope}"
+            )
+        else:
+            st.caption("Pause timing is unavailable for transcript-only input.")
 
         last_report_id = st.session_state.get("last_report_id")
         if last_report_id:
