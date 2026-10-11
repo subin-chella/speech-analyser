@@ -18,6 +18,27 @@ FILLER_PATTERNS = {
 }
 
 
+def _parse_json_object(content: str) -> dict[str, Any]:
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError as original_error:
+        object_start = cleaned.find("{")
+        if object_start < 0:
+            raise ValueError(
+                "The selected model returned text instead of a JSON report. Check the model response format and try again."
+            ) from original_error
+        try:
+            parsed, _ = json.JSONDecoder().raw_decode(cleaned[object_start:])
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "The selected model returned an invalid JSON report. Try again or choose a model with JSON output support."
+            ) from error
+    if not isinstance(parsed, dict):
+        raise ValueError("The selected model response must be a JSON object.")
+    return parsed
+
+
 def _parse_timestamp(value: str) -> float | None:
     match = re.fullmatch(r"(?:(\d+):)?(\d{2}):(\d{2})(?:[.,](\d{1,3}))?", value)
     if not match:
@@ -267,9 +288,28 @@ def analyze_transcript(
     model_name: str,
     api_key: str,
     api_base: str | None = None,
+    communication_goal: str = "Clear, engaging meeting contributions",
 ) -> dict[str, Any]:
     from litellm import completion
 
+    audio_analysis = metrics.get("audio_analysis", {})
+    local_audio = audio_analysis.get("local", {})
+    has_speaker_audio = local_audio.get("status") in ("complete", "partial")
+    text_metrics = {key: value for key, value in metrics.items() if key != "audio_analysis"}
+    audio_guidance = (
+        "Audio coaching is required. Return one to three audio_coaching tips per speaker with usable local results, "
+        "choosing only categories supported by the supplied evidence: Vocal variety, Word stress, or Pauses. "
+        "For Vocal variety, inspect pitch_spread_semitones and turn_pitch_spread_semitones; if pitch range stays narrow across turns, "
+        "say the delivery sounded relatively monotone in this clip and suggest changing pitch across key phrases. "
+        "For Word stress, use content_words_for_review and more_emphasized_words to identify one transcript word that could carry more "
+        "emphasis, or acknowledge a word that was clearly emphasized. Do not claim emphasis from the text alone. "
+        "For Pauses, use pause_moments.after and pause_moments.before to identify where a deliberate pause could help the message land. "
+        "Tie every observation to its exact supplied evidence. Treat pitch and intensity as within-recording comparisons, not universal "
+        "quality scales. Do not infer emotion, personality, confidence, health, or accent quality. Use Azure pronunciation scores only as "
+        "provider feedback if present. Give each tip a short practice action and a way to notice it next time; omit unsupported tips."
+        if has_speaker_audio
+        else "No usable local speaker analysis is available. Return an empty audio_coaching array."
+    )
     scope = (
         f"Evaluate only the participant identified by {target_label!r}. Match speaker labels flexibly: ignore capitalization and punctuation, recognize first/last-name order changes such as 'Prakash Mani' and 'Mani, Prakash', and accept a shortened first or last name only when it identifies one speaker unambiguously. Do not combine different people with similar names. If the identity or speaker turns are ambiguous or absent, say individual attribution is uncertain rather than guessing. Use only this participant's labeled turns for individual observations. "
         + (
@@ -291,21 +331,27 @@ def analyze_transcript(
     )
     prompt = f"""You are a practical communication coach reviewing a meeting transcript.
 Be respectful and specific. Treat spoken language as informal; flag only clear grammatical issues, not acceptable conversational style.
+Communication goal: {communication_goal.strip() or "Clear, engaging meeting contributions"}
 {scope}
 Use the objective metrics as evidence, and distinguish measured facts from interpretations. {timing_guidance} Give no medical or personality judgments.
 Use fillers_by_type to name the most frequent filler only when its count is nonzero. Suggest a practical replacement, such as pausing silently while thinking. Do not claim a filler is frequent when counts are zero, and do not invent measurements.
+{audio_guidance}
 Return only a JSON object with this exact shape:
 {{
   "summary": "short overall assessment",
   "scores": {{"fluency": 0, "clarity": 0, "grammar": 0, "concision": 0}},
   "strengths": ["specific strength"],
   "patterns": [{{"category": "Filler words, Pauses, Repetition, Grammar, or Clarity", "observation": "specific observation", "evidence": "short quote or measured evidence", "suggestion": "one actionable adjustment", "priority": "High, Medium, or Low"}}],
-  "practice_plan": {{"focus": "one behavior", "exercise": "a short practice exercise", "success_metric": "a measurable target for the next meeting"}}
+    "practice_plan": {{"focus": "one behavior", "exercise": "a short practice exercise", "success_metric": "a measurable target for the next meeting"}},
+    "audio_coaching": [{{"speaker_id": "SPEAKER_00", "category": "Vocal variety, Word stress, or Pauses", "observation": "specific behavior heard in this clip", "evidence": "exact acoustic cue, word, or pause location", "suggestion": "one actionable adjustment", "practice": "a short drill tailored to the communication goal", "success_metric": "what to listen for next time"}}]
 }}
-Scores must be integers from 0 to 100. Include no more than four patterns and one practice focus.
+Scores must be integers from 0 to 100. Include no more than four patterns and one transcript practice focus. Return at most three evidence-backed audio_coaching tips per speaker; do not fill categories that the evidence does not support.
 
 Objective speech metrics:
-{json.dumps(metrics, ensure_ascii=True)}
+{json.dumps(text_metrics, ensure_ascii=True)}
+
+Audio analysis evidence:
+{json.dumps(audio_analysis, ensure_ascii=True)}
 
 Transcript:
 {transcript}
@@ -322,6 +368,7 @@ Transcript:
         arguments["api_key"] = api_key
     if api_base:
         arguments["api_base"] = api_base
+        arguments["response_format"] = {"type": "json_object"}
 
     try:
         response = completion(**arguments)
@@ -339,11 +386,23 @@ Transcript:
     content = response.choices[0].message.content
     if not content:
         raise ValueError("The selected model returned an empty coaching report.")
-    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", content.strip(), flags=re.IGNORECASE)
-    analysis = json.loads(cleaned)
+    analysis = _parse_json_object(content)
     required = {"summary", "scores", "strengths", "patterns", "practice_plan"}
     if not required.issubset(analysis):
         raise ValueError("The selected model did not return all required report fields.")
     for score_name in ("fluency", "clarity", "grammar", "concision"):
         analysis["scores"][score_name] = max(0, min(100, int(analysis["scores"].get(score_name, 0))))
+    audio_coaching = analysis.get("audio_coaching", [])
+    if not isinstance(audio_coaching, list):
+        audio_coaching = []
+    analysis["audio_coaching"] = [
+        item
+        for item in audio_coaching
+        if isinstance(item, dict)
+        and all(
+            item.get(key)
+            for key in ("speaker_id", "category", "observation", "evidence", "suggestion", "practice")
+        )
+        and item.get("category") in {"Vocal variety", "Word stress", "Pauses"}
+    ] if has_speaker_audio else []
     return analysis
